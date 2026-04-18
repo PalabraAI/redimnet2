@@ -87,12 +87,18 @@ class ReDimNet2(nn.Module):
             ((1,2),4,1,[(3,3)],64), # 128
             ((2,1),3,1,[(3,3)],96), # 128
         ],
-        group_divisor = 1
+        group_divisor = 1,
+        #-----------------------
+        #     Subnet stuff
+        #-----------------------
+        return_all_outputs = False,
+        offset_fm_weights = 0,
+        is_subnet = False,
     ):
         super().__init__()
         self.F = F
         self.C = C
-        
+
         if causal == 'full':
             block_1d_type = block_1d_type + '-causal'
             block_2d_type = block_2d_type + '-causal'
@@ -104,14 +110,18 @@ class ReDimNet2(nn.Module):
             self.causal = False
         else:
             raise NotImplementedError()
-        
+
         self.block_1d_type = block_1d_type
         self.block_2d_type = block_2d_type
 
         self.stages_setup = stages_setup
         self.fm_weigthing_type = fm_weigthing_type
-        
+
         # Subnet stuff
+        self.is_subnet = is_subnet
+        self.offset_fm_weights = offset_fm_weights
+        self.return_all_outputs = return_all_outputs
+
         self.build(F,C,spec_in_channels,out_channels,stages_setup,group_divisor,
                    compress_tconvs,return_2d_output,use_freq_pos_enc)
         
@@ -130,27 +140,41 @@ class ReDimNet2(nn.Module):
         
         self.num_stages = len(stages_setup)
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(spec_in_channels, int(c), kernel_size=3, stride=1, padding='same'),
-            LayerNorm(int(c), eps=1e-6, data_format="channels_first"),
-            to1d()
-        )
-
         append_to1d_before_tcm = True
         Block1d = functools.partial(TimeContextBlock1d,block_type=self.block_1d_type)
         Block2d = functools.partial(ConvBlock2d,block_type=self.block_2d_type)
 
         if self.fm_weigthing_type == 'NC':
-            agg1d = functools.partial(weigth1d,C=F*C) 
+            agg1d = functools.partial(weigth1d,C=F*C)
         elif self.fm_weigthing_type == 'N':
-            agg1d = functools.partial(weigth1d,C=None) 
+            agg1d = functools.partial(weigth1d,C=None)
         else:
             raise NotImplementedError()
-        
+
+        if not self.is_subnet:
+            self.stem = nn.Sequential(
+                nn.Conv2d(spec_in_channels, int(c), kernel_size=3, stride=1, padding='same'),
+                LayerNorm(int(c), eps=1e-6, data_format="channels_first"),
+                to1d()
+            )
+        else:
+            # Subnet stem: aggregate offset_fm_weights incoming 1D feature maps,
+            # reshape to 2D, then apply a standard conv+norm stem before to1d().
+            assert self.offset_fm_weights > 0, \
+                "offset_fm_weights must be > 0 when is_subnet=True"
+            self.stem = nn.Sequential(
+                agg1d(N=self.offset_fm_weights,
+                      requires_grad=self.offset_fm_weights>1),
+                to2d(f=F, c=C),
+                nn.Conv2d(int(c), int(c), kernel_size=3, stride=1, padding='same'),
+                LayerNorm(int(c), eps=1e-6, data_format="channels_first"),
+                to1d()
+            )
+
         for stage_ind, (stride, num_blocks, conv_exp, kernel_sizes, att_block_red) in enumerate(stages_setup):
             (sf, st) = stride
             tot_stride = np.prod((sf, st))
-            num_feats_to_weight = stage_ind+1
+            num_feats_to_weight = self.offset_fm_weights + stage_ind + 1
             # if tot_stride > 1:
             layers = []
             sft = sft * sf
@@ -196,7 +220,7 @@ class ReDimNet2(nn.Module):
             layers.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
             setattr(self,f'stage{stage_ind}',nn.Sequential(*layers))
 
-        num_feats_to_weight_fin = len(stages_setup)+1
+        num_feats_to_weight_fin = self.offset_fm_weights + len(stages_setup) + 1
         self.fin_wght1d = agg1d(N=num_feats_to_weight_fin, requires_grad=num_feats_to_weight_fin>1)
 
         self.time_stride = max_stt
@@ -218,17 +242,28 @@ class ReDimNet2(nn.Module):
         return x
         
     def forward(self,inp):
-        bs, _, _, T = inp.size()
-        inp = inp[:,:,:,:(T//self.time_stride)*self.time_stride] # Needed for right reshape operations
-        # print(f"T = {T} -> T = {(T//self.time_stride)*self.time_stride}")
-        x = self.stem(inp)
-        outputs_1d = [x]
+        if not self.is_subnet:
+            bs, _, _, T = inp.size()
+            inp = inp[:,:,:,:(T//self.time_stride)*self.time_stride] # Needed for right reshape operations
+            # print(f"T = {T} -> T = {(T//self.time_stride)*self.time_stride}")
+            x = self.stem(inp)
+            outputs_1d = [x]
+        else:
+            assert isinstance(inp, list), \
+                "Subnet-mode ReDimNet2 expects a list of 1D feature maps as input"
+            outputs_1d = list(inp)
+            x = self.stem(inp)
+            outputs_1d.append(x)
+
         for stage_ind in range(self.num_stages):
             outputs_1d.append(self.run_stage(outputs_1d,stage_ind))
         x = self.fin_wght1d(outputs_1d)
         outputs_1d.append(x)
         x = self.fin_to2d(x)
         x = self.head(x)
+
+        if self.return_all_outputs:
+            return x, outputs_1d
         return x
 
 class ReDimNet2Wrap(nn.Module):
@@ -272,12 +307,16 @@ class ReDimNet2Wrap(nn.Module):
         #-------------------------
         spec_params = dict(
             do_spec_aug=False,
-            freq_mask_width = (0, 6), 
+            freq_mask_width = (0, 6),
             time_mask_width = (0, 8),
         ),
+        #-------------------------
+        return_all_outputs = False,
     ):
         super().__init__()
-        
+
+        self.return_all_outputs = return_all_outputs
+
         self.backbone = ReDimNet2(
             F = F, C = C,
             causal = causal,
@@ -285,12 +324,13 @@ class ReDimNet2Wrap(nn.Module):
             out_channels = out_channels,
             return_2d_output = return_2d_output,
             block_1d_type = block_1d_type,
-            block_2d_type = block_2d_type, 
+            block_2d_type = block_2d_type,
             compress_tconvs = compress_tconvs,
             fm_weigthing_type = fm_weigthing_type,
             use_freq_pos_enc = use_freq_pos_enc,
             stages_setup = stages_setup,
-            group_divisor = group_divisor
+            group_divisor = group_divisor,
+            return_all_outputs = return_all_outputs,
         )
         if feat_type in ['pt','pt_mel']:
             self.spec = features.MelBanks(n_mels=F,hop_length=hop_length,**spec_params)
@@ -328,11 +368,14 @@ class ReDimNet2Wrap(nn.Module):
         if self.pad_right_samples is not None:
             x = torch.nn.functional.pad(x, (0, self.pad_right_samples), mode='constant', value=None)
         x = self.spec(x)
-            
+
         if x.ndim == 3:
             x = x.unsqueeze(1)
         # print(f"spec : {x.size()}")
-        out = self.backbone(x)
+        if self.return_all_outputs:
+            out, all_outs_1d = self.backbone(x)
+        else:
+            out = self.backbone(x)
         # print(f"pre pool : {out.size()}")
         if out.ndim == 4:
             bs, C, F, T = out.size()
@@ -341,10 +384,12 @@ class ReDimNet2Wrap(nn.Module):
             out = out[:,:,self.before_pool_offset:]
         out = self.bn(self.pool(out))
         out = self.linear(out)
-        
+
         if self.bn2 is not None:
             out = self.bn2(out)
 
+        if self.return_all_outputs:
+            return out, all_outs_1d
         return out
 
 def ReDimNet2Custom(**kwargs):
