@@ -36,6 +36,12 @@ EER (%) on VoxCeleb1 cleaned protocols:
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
 | ReDimNet2-B6 | 12.5M | 13.05 | 0.17 | 0.34 | 0.68 | 0.95 |
 
+EER (%) on out-of-domain cross-dataset benchmarks (`train_type="lm"`, `dataset="vb2+vox2_v0"`):
+
+| Model | SITW (eval-core) | VOICES (eval) | CN-Celeb (multi-enroll) |
+|:---|:---:|:---:|:---:|
+| ReDimNet2-B6 | 0.66 | 2.59 | 7.39 |
+
 ## Quick Start
 
 ### Via torch.hub
@@ -104,7 +110,7 @@ Pretrained weights are available as GitHub Release assets.
 
 We are actively working on improving model stability and expanding the release. Planned updates:
 
-- [ ] Release a new version of ReDimNet2 with improved normalization unified for both 1D and 2D feature map representations
+- [x] Release a new version of ReDimNet2 with improved normalization unified for both 1D and 2D feature map representations (`agg_gnorm` + `dual_agg` options, first used by the `vb2+vox2_v0` B6 release)
 - [ ] Release the training pipeline (VoxCeleb2)
 - [x] Release VoxBlink2 + VoxCeleb2 pretrained model (B6)
 - [ ] Release VoxBlink2 + VoxCeleb2 pretrained models (B3, distilled B6 → B3)
