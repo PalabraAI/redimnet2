@@ -71,7 +71,7 @@ class ReDimNet2(nn.Module):
         causal = 'none',
         out_channels = None,
         block_1d_type = 'tf-att',
-        block_2d_type = "basic_resnet", 
+        block_2d_type = "basic_resnet",
         return_2d_output = False,
         fm_weigthing_type = 'NC',
         use_freq_pos_enc = False,
@@ -79,15 +79,17 @@ class ReDimNet2(nn.Module):
         stages_setup = [
             # Encoder part:
             ((1,1),2,4,[(3,3)],None), # 16
-            ((2,1),3,3,[(3,3)],None), # 32 
-            
+            ((2,1),3,3,[(3,3)],None), # 32
+
             ((1,2),4,2,[(3,3)],None), # 64,
             ((2,1),5,1,[(3,3)],48), # 128
-            
+
             ((1,2),4,1,[(3,3)],64), # 128
             ((2,1),3,1,[(3,3)],96), # 128
         ],
         group_divisor = 1,
+        dual_agg = False,
+        agg_gnorm = False,
         #-----------------------
         #     Subnet stuff
         #-----------------------
@@ -116,6 +118,8 @@ class ReDimNet2(nn.Module):
 
         self.stages_setup = stages_setup
         self.fm_weigthing_type = fm_weigthing_type
+        self.dual_agg = dual_agg
+        self.agg_gnorm = agg_gnorm
 
         # Subnet stuff
         self.is_subnet = is_subnet
@@ -171,10 +175,18 @@ class ReDimNet2(nn.Module):
                 to1d()
             )
 
+        if self.agg_gnorm:
+            self.stem_gnorm = nn.GroupNorm(num_groups=C, num_channels=C*F)
+
+        # Track accumulated feature-map count for the weigth1d N parameter.
+        # Starts at offset_fm_weights+1 to account for the subnet offset + stem output.
+        feat_count = self.offset_fm_weights + 1
+        self._stage_has_dual = []
+
         for stage_ind, (stride, num_blocks, conv_exp, kernel_sizes, att_block_red) in enumerate(stages_setup):
             (sf, st) = stride
             tot_stride = np.prod((sf, st))
-            num_feats_to_weight = self.offset_fm_weights + stage_ind + 1
+            num_feats_to_weight = feat_count
             # if tot_stride > 1:
             layers = []
             sft = sft * sf
@@ -183,24 +195,24 @@ class ReDimNet2(nn.Module):
             layers.append(to2d(f=f, c=c))
             if use_freq_pos_enc:
                 layers.append(FreqEncoder(c=c,bins=f))
-                
-            layers.append(ShapeLogger(nn.Conv2d(int(c), int(sf*c*conv_exp), 
-                            kernel_size=(sf,stt), 
+
+            layers.append(ShapeLogger(nn.Conv2d(int(c), int(sf*c*conv_exp),
+                            kernel_size=(sf,stt),
                             stride=(sf,stt),
-                            padding=0, groups=1 if not compress_tconvs else 
+                            padding=0, groups=1 if not compress_tconvs else
                                         math.gcd(int(c),int(sf*c*conv_exp)))))
-                
+
             c = sf * c
             assert f % sf == 0
             f = f // sf
-                
+
             if stt >= max_stt:
                 max_stt = stt
-        
+
             for block_ind in range(num_blocks):
-                layers.append(Block2d(c=int(c*conv_exp), f=f, 
+                layers.append(Block2d(c=int(c*conv_exp), f=f,
                                       kernel_sizes=kernel_sizes, Gdiv=group_divisor))
-            
+
             if conv_exp != 1:
                 _group_divisor = group_divisor
                 layers.append(nn.Sequential(
@@ -208,20 +220,50 @@ class ReDimNet2(nn.Module):
                     nn.BatchNorm2d(c, eps=1e-6)
                 ))
 
-            if append_to1d_before_tcm:
-                layers.append(to1d())
-            if att_block_red is not None:
-                if append_to1d_before_tcm:
-                    layers.append(Block1d(C*F,hC=(C*F)//att_block_red))
-                else:
-                    layers.append(Block1d(C=c,F=f,hC=att_block_red))
-            if not append_to1d_before_tcm:
-                layers.append(to1d())
-            layers.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
-            setattr(self,f'stage{stage_ind}',nn.Sequential(*layers))
+            has_dual = self.dual_agg and att_block_red is not None
 
-        num_feats_to_weight_fin = self.offset_fm_weights + len(stages_setup) + 1
-        self.fin_wght1d = agg1d(N=num_feats_to_weight_fin, requires_grad=num_feats_to_weight_fin>1)
+            if has_dual:
+                # Split the stage so the 1D-attention branch runs in parallel with
+                # a plain 2D->1D reshape branch; both are upsampled (+gnorm) and
+                # aggregated alongside prior feature maps.
+                if append_to1d_before_tcm:
+                    layers.append(to1d())
+                setattr(self, f'stage{stage_ind}_pre', nn.Sequential(*layers))
+
+                blk_1d = Block1d(C*F, hC=(C*F)//att_block_red)
+                setattr(self, f'stage{stage_ind}_1d', blk_1d)
+
+                up_2d = [ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest'))]
+                if self.agg_gnorm:
+                    up_2d.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                setattr(self, f'stage{stage_ind}_up_2d', nn.Sequential(*up_2d))
+
+                up_1d = [ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest'))]
+                if self.agg_gnorm:
+                    up_1d.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                setattr(self, f'stage{stage_ind}_up_1d', nn.Sequential(*up_1d))
+
+                self._stage_has_dual.append(True)
+                feat_count += 2
+            else:
+                if append_to1d_before_tcm:
+                    layers.append(to1d())
+                if att_block_red is not None:
+                    if append_to1d_before_tcm:
+                        layers.append(Block1d(C*F,hC=(C*F)//att_block_red))
+                    else:
+                        layers.append(Block1d(C=c,F=f,hC=att_block_red))
+                if not append_to1d_before_tcm:
+                    layers.append(to1d())
+                layers.append(ShapeLogger(nn.Upsample(scale_factor=stt, mode='nearest')))
+                if self.agg_gnorm:
+                    layers.append(nn.GroupNorm(num_groups=C, num_channels=C*F))
+                setattr(self,f'stage{stage_ind}',nn.Sequential(*layers))
+
+                self._stage_has_dual.append(False)
+                feat_count += 1
+
+        self.fin_wght1d = agg1d(N=feat_count, requires_grad=feat_count>1)
 
         self.time_stride = max_stt
         self.freq_stride = sft
@@ -237,26 +279,38 @@ class ReDimNet2(nn.Module):
                 self.head = nn.Conv1d(C*F, out_channels, 1)
         
     def run_stage(self,prev_outs_1d, stage_ind):
+        if self._stage_has_dual[stage_ind]:
+            pre = getattr(self, f'stage{stage_ind}_pre')
+            blk_1d = getattr(self, f'stage{stage_ind}_1d')
+            up_2d = getattr(self, f'stage{stage_ind}_up_2d')
+            up_1d = getattr(self, f'stage{stage_ind}_up_1d')
+            x_pre = pre(prev_outs_1d)
+            x_2d = up_2d(x_pre)
+            x_1d = up_1d(blk_1d(x_pre))
+            return [x_2d, x_1d]
         stage = getattr(self,f'stage{stage_ind}')
-        x = stage(prev_outs_1d)
-        return x
-        
+        return [stage(prev_outs_1d)]
+
     def forward(self,inp):
         if not self.is_subnet:
             bs, _, _, T = inp.size()
             inp = inp[:,:,:,:(T//self.time_stride)*self.time_stride] # Needed for right reshape operations
             # print(f"T = {T} -> T = {(T//self.time_stride)*self.time_stride}")
             x = self.stem(inp)
+            if self.agg_gnorm:
+                x = self.stem_gnorm(x)
             outputs_1d = [x]
         else:
             assert isinstance(inp, list), \
                 "Subnet-mode ReDimNet2 expects a list of 1D feature maps as input"
             outputs_1d = list(inp)
             x = self.stem(inp)
+            if self.agg_gnorm:
+                x = self.stem_gnorm(x)
             outputs_1d.append(x)
 
         for stage_ind in range(self.num_stages):
-            outputs_1d.append(self.run_stage(outputs_1d,stage_ind))
+            outputs_1d.extend(self.run_stage(outputs_1d,stage_ind))
         x = self.fin_wght1d(outputs_1d)
         outputs_1d.append(x)
         x = self.fin_to2d(x)
@@ -283,15 +337,17 @@ class ReDimNet2Wrap(nn.Module):
         stages_setup = [
             # Encoder part:
             ((1,1),2,4,[(3,3)],24), # 16
-            ((2,1),3,3,[(3,3)],24), # 32 
-            
+            ((2,1),3,3,[(3,3)],24), # 32
+
             ((1,2),4,2,[(3,3)],24), # 64,
             ((2,1),5,1,[(3,3)],24), # 128
-            
+
             ((1,2),4,1,[(3,3)],24), # 128
             ((2,1),3,1,[(3,3)],24), # 128
         ],
         group_divisor = 1,
+        dual_agg = False,
+        agg_gnorm = False,
         #-------------------------
         embed_dim=192,
         num_classes=None,
@@ -330,6 +386,8 @@ class ReDimNet2Wrap(nn.Module):
             use_freq_pos_enc = use_freq_pos_enc,
             stages_setup = stages_setup,
             group_divisor = group_divisor,
+            dual_agg = dual_agg,
+            agg_gnorm = agg_gnorm,
             return_all_outputs = return_all_outputs,
         )
         if feat_type in ['pt','pt_mel']:
